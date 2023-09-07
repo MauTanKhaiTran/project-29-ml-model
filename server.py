@@ -65,7 +65,7 @@ def generate_chat_response(prompt):
 
 @app.route('/', methods=['GET'])
 def index():
-    return render_template('index.html')
+    return "hello"
 
 @app.route('/predict', methods=['POST'])
 def upload():
