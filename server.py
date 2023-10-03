@@ -11,27 +11,15 @@ import openai
 import joblib
 import mahotas
 from sklearn.preprocessing import MinMaxScaler
+from osgeo import gdal
 
 openai.api_key = os.getenv('OPENAI_API_KEY')
 
 app = Flask(__name__)
 CORS(app)
 
-# Load saved model
-# model = tf.keras.models.load_model('my_model_2')
-# model._make_predict_function()          # Necessary
 
-# def model_predict(img_path, model):
-#     image = load_img(img_path, target_size=(224, 224))
-#     image_array = img_to_array(image)
-#     image_array = np.expand_dims(image_array, axis=0)
-
-#     preds = model.predict(image_array)
-#     if preds[0] < 0.3:
-#         return "DISEASED"
-#     else:
-#         return "HEALTHY"
-
+#################### Leaf Disease Detection ####################
 # classes for CNN
 leaf_classes = [
     'Target_Spot',
@@ -53,12 +41,10 @@ leaf_classes_2 = ['Bacterial_spot', 'Early_blight', 'Late_blight', 'Leaf_Mold', 
 def rgb_bgr(image):
     rgb_img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     return rgb_img
-
 # Conversion to HSV image format from RGB
 def bgr_hsv(rgb_img):
     hsv_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2HSV)
     return hsv_img
-
 # image segmentation
 # for extraction of green and brown color
 def img_segmentation(rgb_img,hsv_img):
@@ -73,19 +59,16 @@ def img_segmentation(rgb_img,hsv_img):
     final_mask = healthy_mask + disease_mask
     final_result = cv2.bitwise_and(rgb_img, rgb_img, mask=final_mask)
     return final_result
-
 # feature-descriptor-1: Hu Moments
 def fd_hu_moments(image):
     image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     feature = cv2.HuMoments(cv2.moments(image)).flatten()
     return feature
-
 # feature-descriptor-2: Haralick Texture
 def fd_haralick(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     haralick = mahotas.features.haralick(gray).mean(axis=0)
     return haralick
-
 # feature-descriptor-3: Color Histogram
 def fd_histogram(image, mask=None):
     bins = 8
@@ -93,7 +76,6 @@ def fd_histogram(image, mask=None):
     hist  = cv2.calcHist([image], [0, 1, 2], None, [bins, bins, bins], [0, 256, 0, 256, 0, 256])
     cv2.normalize(hist, hist)
     return hist.flatten()
-
 #  pre-process image for dt and rf model
 def preprocess_image(img):    # Running Function Bit By Bit
     RGB_BGR       = rgb_bgr(img)
@@ -199,6 +181,71 @@ def generate_chat_response(prompt):
     else:
         return "Your plant is healthy. No need to worry."
 
+
+#################### Process Satellite Image ####################
+def ndvi_calc(input_file):
+    # open file using GDAL
+    ds = gdal.Open(input_file)
+    # RGB: read data from raster bands
+    red_band = ds.GetRasterBand(1).ReadAsArray().astype(np.uint8)
+    green_band = ds.GetRasterBand(2).ReadAsArray().astype(np.uint8)
+    blue_band = ds.GetRasterBand(3).ReadAsArray().astype(np.uint8)
+    # create RGB imgae
+    rgb_image = np.dstack((red_band, green_band, blue_band))
+    # NDVI: read data from raster bands
+    red_band = ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
+    nir_band = ds.GetRasterBand(2).ReadAsArray().astype(np.float32)
+    # prevent zero division error
+    nir_band[nir_band == 0] = 1
+    # calculate NDVI
+    ndvi = (nir_band - red_band) / (nir_band + red_band)
+    # specify name of output file
+    output_rgb_file = "rgb_image.png"
+    output_ndvi_file = "ndvi_image.png"
+    output_scaled_ndvi_file = "scaled_ndvi_image.png"
+
+    plt.imshow(rgb_image)
+    plt.savefig(output_rgb_file)
+    # plt.show()
+
+    plt.imshow(ndvi, cmap='RdYlGn')
+    plt.colorbar()
+    plt.title('NDVI')
+    plt.savefig(output_ndvi_file)
+    # normalize NDVI values between -1 to 1
+    desired_min = -1
+    desired_max = 1
+
+    # scale NDVI
+    scaled_ndvi = 2 * (ndvi - np.min(ndvi)) / (np.max(ndvi) - np.min(ndvi)) - 1
+
+    # Show scaled NDVI
+    fig, ax = plt.subplots()  # Create a figure and axis
+
+    # Plot the scaled NDVI
+    im = ax.imshow(scaled_ndvi, cmap='RdYlGn', vmin=desired_min, vmax=desired_max)
+
+    # Create a colorbar for the scaled NDVI
+    cbar = plt.colorbar(im, ax=ax)
+
+    # Set the title for the scaled NDVI chart
+    ax.set_title('Scaled NDVI')
+
+    # Save the chart
+    plt.savefig(output_scaled_ndvi_file)
+    # plt.show()
+
+    # obtain maximum and minimum values from NDVI (-1, 1)
+    max_ndvi = np.max(scaled_ndvi)
+    min_ndvi = np.min(scaled_ndvi)
+
+    # print maximum and minimum values
+    print(f"Maximum NDVI: {max_ndvi}")
+    print(f"Minimum NDVI: {min_ndvi}")
+
+
+
+#################### Flask API ####################
 @app.route('/', methods=['GET'])
 def index():
     return render_template('index.html')
@@ -208,26 +255,33 @@ def upload():
     if request.method == 'POST':
         # Get the file from post request
         imageType = request.form['imageType']
-        modelType = request.form['modelType']
         print("Image type:", imageType)
-        print("Model type:", modelType)
 
         # Get the image file from the request
         image = request.files['image']
-
         # Save the image file
         basepath = os.path.dirname(__file__)
         file_path = os.path.join(basepath, 'uploads', secure_filename(image.filename))
         image.save(file_path)
 
-        # Perform prediction and return response
-        result = model_predict(file_path, modelType)
-        solution = generate_chat_response(result)
+        if imageType == "leaf":
+            modelType = request.form['modelType']
+            print("Model type:", modelType)
 
-        # print(solution)
-        response_data = {'prediction': result, 'solution': solution}
-        return jsonify(response_data)
+            # Perform prediction and return response
+            result = model_predict(file_path, modelType)
+            solution = generate_chat_response(result)
+
+            # print(solution)
+            response_data = {'prediction': result, 'solution': solution}
+            return jsonify(response_data)
+        else:
+            ndvi_calc(file_path)
+            return jsonify({'success': 'NDVI image generated'})
+
     return None
+
+
 
 @app.route('/get_plot', methods=['GET'])
 def get_plot():
@@ -254,6 +308,46 @@ def get_history():
     else:
         print("Training history not found")
         return jsonify({'error': 'Training history not found'})
+
+
+@app.route('/get_rgb_image', methods=['GET'])
+def get_rgb_image():
+    # Make sure to provide the correct path to the saved image file
+    img_filename = 'rgb_image.png'
+
+    # Check if the image file exists
+    if os.path.exists(img_filename):
+        print("RGB image sent")
+        return send_file(img_filename, mimetype='image/png')
+    else:
+        print("RGB image not found")
+        return jsonify({'error': 'RGB image not found'})
+
+@app.route('/get_ndvi_image', methods=['GET'])
+def get_ndvi_image():
+    # Make sure to provide the correct path to the saved image file
+    img_filename = 'ndvi_image.png'
+
+    # Check if the image file exists
+    if os.path.exists(img_filename):
+        print("NDVI image sent")
+        return send_file(img_filename, mimetype='image/png')
+    else:
+        print("NDVI image not found")
+        return jsonify({'error': 'NDVI image not found'})
+
+@app.route('/get_scaled_ndvi_image', methods=['GET'])
+def get_scaled_ndvi_image():
+    # Make sure to provide the correct path to the saved image file
+    img_filename = 'scaled_ndvi_image.png'
+
+    # Check if the image file exists
+    if os.path.exists(img_filename):
+        print("Scaled NDVI image sent")
+        return send_file(img_filename, mimetype='image/png')
+    else:
+        print("Scaled NDVI image not found")
+        return jsonify({'error': 'Scaled NDVI image not found'})
 
 if __name__ == '__main__':
     app.run(debug=True)
